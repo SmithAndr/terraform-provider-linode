@@ -66,9 +66,16 @@ func resourceLinodeLinode() *schema.Resource {
 			"size": &schema.Schema{
 				Type:     schema.TypeInt,
 				Required: true,
-				ForceNew: true,
 			},
 			"status": &schema.Schema{
+				Type:     schema.TypeInt,
+				Computed: true,
+			},
+			"plan_storage": &schema.Schema{
+				Type:     schema.TypeInt,
+				Computed: true,
+			},
+			"plan_storage_utilized": &schema.Schema{
 				Type:     schema.TypeInt,
 				Computed: true,
 			},
@@ -105,6 +112,16 @@ func resourceLinodeLinode() *schema.Resource {
 				Type:     schema.TypeBool,
 				Optional: true,
 				Default:  true,
+			},
+			"disk_expansion": &schema.Schema{
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
+			},
+			"swap_size": &schema.Schema{
+				Type: schema.TypeInt,
+				Optional: true,
+				Default: 512,
 			},
 		},
 	}
@@ -157,6 +174,42 @@ func resourceLinodeLinodeRead(d *schema.ResourceData, meta interface{}) error {
 	d.Set("status", linode.Status)
 	d.SetPartial("status")
 
+    sizeId, err := getSizeId(client, d.Get("size").(int))
+	if err != nil {
+		return err
+	}
+    plan_storage, err := getPlanDiskSize(client, sizeId)
+	if err != nil {
+		return err
+	}
+	d.Set("plan_storage", plan_storage)
+	d.SetPartial("plan_storage")
+
+	plan_storage_utilized, err := getTotalDiskSize(client, linode.LinodeId)
+	if err != nil {
+		return err
+	}
+	d.Set("plan_storage_utilized", plan_storage_utilized)
+	d.SetPartial("plan_storage_utilized")
+
+	d.Set("disk_expansion", boolToString(d.Get("disk_expansion").(bool)))
+	d.SetPartial("disk_expansion")
+
+	diskResp, err := client.Disk.List(linode.LinodeId, -1)
+	if err != nil {
+		return fmt.Errorf("Failed to get the disks for the linode because %s", err)
+	}
+
+	// Determine if swap exists and the size.  If it does not exist, swap_size=0
+	swap_size := 0
+	for i := range diskResp.Disks {
+		if strings.EqualFold(diskResp.Disks[i].Type, "swap") {
+			swap_size = diskResp.Disks[i].Size
+		}
+	}
+	d.Set("swap_size", swap_size)
+	d.SetPartial("swap_size")
+
 	configs, err := client.Config.List(int(id), -1)
 	if err != nil {
 		log.Printf("Configs: %v", configs)
@@ -166,12 +219,15 @@ func resourceLinodeLinodeRead(d *schema.ResourceData, meta interface{}) error {
 	}
 	config := configs.LinodeConfigs[0]
 
-	image, err := getImage(client, int(id))
-	if err != nil {
-		return fmt.Errorf("Failed to get the image because %s", image)
-	}
-	d.Set("image", image)
-	d.SetPartial("image")
+// This doesn't really tell us much.  This will flunk if an ImageName is used to deploy, since getImage will return
+// an imageID.  Trying to derive the imageName from an imageID could be bad if the image happens to be deleted, which would
+// likely occur in an environment where base image's are lifecycled. 
+//	image, err := getImage(client, int(id))
+//	if err != nil {
+//		return fmt.Errorf("Failed to get the image because %s", err)
+//	}
+//	d.Set("image", image)
+//	d.SetPartial("image")
 
 	d.Set("helper_distro", boolToString(config.HelperDistro.Bool))
 	d.SetPartial("helper_distro")
@@ -210,11 +266,15 @@ func resourceLinodeLinodeCreate(d *schema.ResourceData, meta interface{}) error 
 	d.SetPartial("region")
 	d.SetPartial("size")
 
-	emptyArgs := make(map[string]string)
-	_, err = client.Disk.Create(create.LinodeId.LinodeId, "swap", "swap", 512, emptyArgs)
-	if err != nil {
-		return fmt.Errorf("Failed to create a swap drive because %s", err)
+	// Create the Swap Partition
+	if d.Get("swap_size").(int) > 0 {
+		emptyArgs := make(map[string]string)
+		_, err = client.Disk.Create(create.LinodeId.LinodeId, "swap", "swap", d.Get("swap_size").(int), emptyArgs)
+		if err != nil {
+			return fmt.Errorf("Failed to create a swap drive because %s", err)
+		}
 	}
+	d.SetPartial("swap_size")
 
 	// Load the basic data about the current linode
 	linodes, err := client.Linode.List(create.LinodeId.LinodeId)
@@ -241,7 +301,8 @@ func resourceLinodeLinodeCreate(d *schema.ResourceData, meta interface{}) error 
 
 	ssh_key := d.Get("ssh_key").(string)
 	password := d.Get("root_password").(string)
-	err = deployImage(client, linode, d.Get("image").(string), ssh_key, password)
+	disk_size := (linode.TotalHD - d.Get("swap_size").(int))
+	err = deployImage(client, linode, d.Get("image").(string), disk_size, ssh_key, password)
 	if err != nil {
 		return fmt.Errorf("Failed to create disk for image %s because %s", d.Get("image"), err)
 	}
@@ -256,10 +317,10 @@ func resourceLinodeLinodeCreate(d *schema.ResourceData, meta interface{}) error 
 	var rootDisk int
 	var swapDisk int
 	for i := range diskResp.Disks {
-		if strings.HasSuffix(diskResp.Disks[i].Label.String(), "Disk") {
-			rootDisk = diskResp.Disks[i].DiskId
-		} else {
+		if strings.EqualFold(diskResp.Disks[i].Type, "swap") {
 			swapDisk = diskResp.Disks[i].DiskId
+		} else {
+			rootDisk = diskResp.Disks[i].DiskId
 		}
 	}
 
@@ -279,7 +340,11 @@ func resourceLinodeLinodeCreate(d *schema.ResourceData, meta interface{}) error 
 	} else {
 		confArgs["helper_distro"] = "false"
 	}
-	confArgs["DiskList"] = fmt.Sprintf("%d,%d", rootDisk, swapDisk)
+	if d.Get("swap_size").(int) > 0 {
+		confArgs["DiskList"] = fmt.Sprintf("%d,%d", rootDisk, swapDisk)
+	} else {
+		confArgs["DiskList"] = fmt.Sprintf("%d", rootDisk)
+	}
 	confArgs["RootDeviceNum"] = "1"
 	c, err := client.Config.Create(linode.LinodeId, kernelId, d.Get("image").(string), confArgs)
 	if err != nil {
@@ -319,6 +384,15 @@ func resourceLinodeLinodeUpdate(d *schema.ResourceData, meta interface{}) error 
 	if d.HasChange("name") || d.HasChange("group") {
 		if err = changeLinodeSettings(client, linode, d); err != nil {
 			return err
+		}
+	}
+
+	if d.HasChange("size") {
+		if err = changeLinodeSize(client, linode, d); err != nil {
+			return err
+		}
+		if err = waitForJobsToComplete(client, int(id)); err != nil {
+			return fmt.Errorf("Failed while waiting for linode %s to finish resizing because %s", d.Id(), err)
 		}
 	}
 
@@ -394,8 +468,16 @@ func getImage(client *linodego.Client, id int) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Assumes disk naming convention of Root(LINODEID)__Base(IMAGEID)
+	grabId := regexp.MustCompile(`Base\(([0-9]+)\)`)
 	for i := range disks {
-		if strings.HasSuffix(disks[i], " Disk") {
+		// Check if we match the pattern at all
+		if grabId.MatchString(disks[i]) {
+			// Print out the first group match
+			return grabId.FindStringSubmatch(disks[i])[1], nil
+
+		// Keep the old method for backward compatibility
+		} else if strings.HasSuffix(disks[i], " Disk") {
 			return disks[i][:(len(disks[i]) - 5)], nil
 		}
 	}
@@ -514,7 +596,7 @@ func getSizeId(client *linodego.Client, size int) (int, error) {
 			return s[i].PlanId, nil
 		}
 	}
-	return -1, fmt.Errorf("Unable to locate the plan for size %d", size)
+	return -1, fmt.Errorf("Unable to locate the plan with RAM %d", size)
 }
 
 // getSize gets the amount of ram from the plan id
@@ -543,6 +625,63 @@ func getSizeList(client *linodego.Client) error {
 	}
 	sizeList = &resp.LinodePlans
 	return nil
+}
+
+// getPlanDiskSizeList gets the total available disk space for the given PlanID
+func getPlanDiskSize(client *linodego.Client, planID int) (int, error) {
+	if sizeList == nil {
+		if err := getSizeList(client); err != nil {
+			return -1, err
+		}
+	}
+
+	s := *sizeList
+	for i := range s {
+		if s[i].PlanId == planID {
+			// Return Plan Disk Size in Megabytes
+			return (s[i].Disk*1024), nil
+		}
+	}
+	return -1, fmt.Errorf("Unabled to find plan id %d", planID)
+}
+
+// getTotalDiskSize returns the number of disks and their total size.
+func getTotalDiskSize(client *linodego.Client, linodeID int) (int, error) {
+	var totalDiskSize int
+	diskList, err := client.Disk.List(linodeID, -1)
+	if err != nil {
+		return -1, err
+	}
+
+	totalDiskSize = 0
+	disks := diskList.Disks
+	for i := range disks {
+		// Calculate Total Disk Size
+		totalDiskSize = totalDiskSize + disks[i].Size
+	}
+
+	return totalDiskSize, nil
+}
+
+// getBiggestDisk returns the ID and Size of the largest disk attached to the Linode
+func getBiggestDisk(client *linodego.Client, linodeID int) (biggestDiskID int, biggestDiskSize int, err error) {
+	// Retrieve the Linode's list of disks
+	diskList, err := client.Disk.List(linodeID, -1)
+	if err != nil {
+		return -1, -1, err
+	}
+
+	biggestDiskID = 0
+	biggestDiskSize = 0
+	disks := diskList.Disks
+	for i := range disks {
+		// Find Biggest Disk ID & Size
+		if disks[i].Size > biggestDiskSize {
+			biggestDiskID = disks[i].DiskId
+			biggestDiskSize = disks[i].Size
+		}
+	}
+	return biggestDiskID, biggestDiskSize, nil
 }
 
 // getIps gets the ips assigned to the linode
@@ -587,6 +726,8 @@ const (
 // findImage finds the specified image. It checks the prebuilt images first and then any custom images. It returns both
 // the image type and the images id
 func findImage(client *linodego.Client, imageName string) (imageType, imageId int, err error) {
+
+	// Get Available Distributions
 	distResp, err := client.Avail.Distributions()
 	if err != nil {
 		return -1, -1, err
@@ -598,6 +739,7 @@ func findImage(client *linodego.Client, imageName string) (imageType, imageId in
 		}
 	}
 
+	// Get Available Client Images
 	custResp, err := client.Image.List()
 	if err != nil {
 		return -1, -1, err
@@ -607,32 +749,41 @@ func findImage(client *linodego.Client, imageName string) (imageType, imageId in
 		if customImages[i].Label.String() == imageName {
 			return CUSTOM_IMAGE, customImages[i].ImageId, nil
 		}
+		if strconv.Itoa(customImages[i].ImageId) == imageName {
+			return CUSTOM_IMAGE, customImages[i].ImageId, nil
+		}
 	}
 
 	return -1, -1, fmt.Errorf("Failed to find image %s", imageName)
 }
 
 // deployImage deploys the specified image
-func deployImage(client *linodego.Client, linode linodego.Linode, imageName string, key, password string) error {
-	t, id, err := findImage(client, imageName)
+// DiskLabel has 50 characters maximum!!!
+func deployImage(client *linodego.Client, linode linodego.Linode, imageName string, diskSize int, key, password string) error {
+	imageType, imageId, err := findImage(client, imageName)
 	if err != nil {
 		return err
 	}
 	args := make(map[string]string)
 	args["rootSSHKey"] = key
 	args["rootPass"] = password
-	if t == PREBUILT {
-		_, err = client.Disk.CreateFromDistribution(id, linode.LinodeId, fmt.Sprintf("%s Disk", imageName), linode.TotalHD-512, args)
+	diskLabel := fmt.Sprintf("Root(%d)__Base(%d)", linode.LinodeId, imageId)
+	if imageType == PREBUILT {
+		_, err = client.Disk.CreateFromDistribution(imageId, linode.LinodeId, diskLabel, diskSize, args)
 		if err != nil {
 			return err
 		}
-	} else if t == CUSTOM_IMAGE {
-		_, err = client.Disk.CreateFromImage(id, linode.LinodeId, fmt.Sprintf("%s Disk", imageName), linode.TotalHD-512, args)
+	} else if imageType == CUSTOM_IMAGE {
+		_, err = client.Disk.CreateFromImage(imageId, linode.LinodeId, diskLabel, diskSize, args)
 		if err != nil {
 			return err
 		}
 	} else {
 		panic("Invalid image type returned")
+	}
+	err = waitForJobsToComplete(client, linode.LinodeId)
+	if err != nil {
+		return fmt.Errorf("Image %d failed to thaw for linode %d because %s", imageId, linode.LinodeId, err)
 	}
 	return nil
 }
@@ -662,6 +813,34 @@ func waitForJobsToComplete(client *linodego.Client, linodeId int) error {
 	}
 }
 
+// waitForJobsToCompleteWaitMinutes waits (waitMinutes) for all of the jobs on the specified linode to complete before returning.
+// It will timeout after (waitMinutes) has elapsed.
+func waitForJobsToCompleteWaitMinutes(client *linodego.Client, linodeId int, waitMinutes int) error {
+	start := time.Now()
+	for {
+		jobs, err := client.Job.List(linodeId, -1, false)
+		if err != nil {
+			return err
+		}
+		complete := true
+		for i := range jobs.Jobs {
+			if !jobs.Jobs[i].HostFinishDt.IsSet() {
+				complete = false
+				// MAKEME: log.Printf("[INFO] JOB:(%s) %s", jobs.Jobs[i].Label, jobs.Jobs[i].HostMessage)
+				// Can't figure out how to print this to the console. This would give the pending job status and ETA.
+			}
+		}
+		if complete {
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+		if time.Since(start) > (time.Duration(waitMinutes) * time.Minute) {
+			return fmt.Errorf("Jobs for linode %d didn't complete in %d minute(s)", linodeId, waitMinutes)
+		}
+	}
+}
+
+
 // changeLinodeSettings changes linode level settings. This is things like the name or the group
 func changeLinodeSettings(client *linodego.Client, linode linodego.Linode, d *schema.ResourceData) error {
 	updates := make(map[string]interface{})
@@ -681,6 +860,61 @@ func changeLinodeSettings(client *linodego.Client, linode linodego.Linode, d *sc
 	}
 	d.SetPartial("group")
 	d.SetPartial("name")
+	return nil
+}
+
+// changeLinodeSize resizes the current linode
+func changeLinodeSize(client *linodego.Client, linode linodego.Linode, d *schema.ResourceData) error {
+	var newPlanID int
+	var waitMinutes int
+
+	// Get the Linode Plan Size
+	sizeId, err := getSizeId(client, d.Get("size").(int))
+	if err != nil {
+		return fmt.Errorf("Failed to find a Plan with %d RAM because %s", d.Get("size"), err)
+	}
+	newPlanID = sizeId
+
+	// Check if we can safely resize, with Disk Size considered
+	currentDiskSize, err := getTotalDiskSize(client, linode.LinodeId)
+	newDiskSize, err := getPlanDiskSize(client, newPlanID)
+	if currentDiskSize > newDiskSize {
+		return fmt.Errorf("Cannot resize linode %d because currentDisk(%d GB) is bigger than newDisk(%d GB)", linode.LinodeId, currentDiskSize, newDiskSize)
+	}
+
+	// Resize the Linode
+	client.Linode.Resize(linode.LinodeId, newPlanID)
+	// Linode says 1-3 minutes per gigabyte for Resize time... Let's be safe with 3
+	waitMinutes = ((linode.TotalHD/1024)*3)
+	// Wait for the Resize Operation to Complete
+	err = waitForJobsToCompleteWaitMinutes(client, linode.LinodeId, waitMinutes)
+	if err != nil {
+		return fmt.Errorf("Failed to wait for linode %d resize because %s", linode.LinodeId, err)
+	}
+
+	if d.Get("disk_expansion").(bool) {
+		// Determine the biggestDisk ID and Size
+		biggestDiskID, biggestDiskSize, err := getBiggestDisk(client, linode.LinodeId)
+		if err != nil {
+			return err
+		}
+		// Calculate new size, with other disks taken into consideration
+		expandedDiskSize := (newDiskSize - (currentDiskSize - biggestDiskSize))
+
+		// Resize the Disk
+		client.Disk.Resize(linode.LinodeId, biggestDiskID, expandedDiskSize)
+		// Wait for the Disk Resize Operation to Complete
+		err = waitForJobsToCompleteWaitMinutes(client, linode.LinodeId, waitMinutes)
+		if err != nil {
+			return fmt.Errorf("Failed to wait for resize of Disk %d for Linode %d because %s", biggestDiskID, linode.LinodeId, err)
+		}
+	}
+
+	// Boot up the resized Linode
+	client.Linode.Boot(linode.LinodeId, 0)
+
+	// Return the new Linode size
+	d.SetPartial("size")
 	return nil
 }
 
