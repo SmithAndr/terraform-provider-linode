@@ -221,7 +221,7 @@ func resourceLinodeLinodeRead(d *schema.ResourceData, meta interface{}) error {
 
 // This doesn't really tell us much.  This will flunk if an ImageName is used to deploy, since getImage will return
 // an imageID.  Trying to derive the imageName from an imageID could be bad if the image happens to be deleted, which would
-// likely occur in an environment where base image's are lifecycled. 
+// likely occur in an environment where base image's are lifecycled.
 //	image, err := getImage(client, int(id))
 //	if err != nil {
 //		return fmt.Errorf("Failed to get the image because %s", err)
@@ -526,6 +526,25 @@ func getKernelID(client *linodego.Client, kernelName string) (int, error) {
 	return -1, fmt.Errorf("Failed to find kernel %s", kernelName)
 }
 
+func getCustomString(str string) linodego.CustomString {
+	var cs linodego.CustomString;
+	b := []byte(str)
+	cs.UnmarshalJSON(b)
+	return cs
+}
+// Not listed for some reason.
+var unlistedKernels = []linodego.Kernel{{
+	Label: getCustomString("GRUB 2"),
+	IsXen: 0,
+	IsPVOPS: 0,
+	KernelId: 210,
+}, {
+	Label: getCustomString("Direct Disk"),
+	IsXen: 0,
+	IsPVOPS: 0,
+	KernelId: 213,
+}}
+
 // getKernelList populates kernelList with all of the available kernels. kernelList is purely to reduce the number of
 // api calls as the available kernels are unlikely to change within a single terraform run.
 func getKernelList(client *linodego.Client) error {
@@ -534,6 +553,7 @@ func getKernelList(client *linodego.Client) error {
 		return err
 	}
 	kernelList = &kernels.Kernels
+	*kernelList = append(*kernelList, unlistedKernels...)
 	return nil
 }
 
